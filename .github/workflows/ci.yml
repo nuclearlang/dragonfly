@@ -1,0 +1,36 @@
+# The dragonfly CLI, built inside the nuclear working tree.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: nuclearlang/nuclear
+          path: nuclear
+      - uses: actions/checkout@v4
+        with:
+          path: nuclear/dragonfly
+      - name: The other repositories of the working tree
+        run: |
+          git clone --depth 1 https://github.com/nuclearlang/dragonfly-mobile nuclear/dragonfly-mobile
+          git clone --depth 1 https://github.com/nuclearlang/dragonfly-backend nuclear/dragonfly-backend
+          git clone --depth 1 https://github.com/nuclearlang/dragonfly-web nuclear/dragonfly-web
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: "Tests and clippy"
+        working-directory: nuclear/dragonfly
+        run: |
+          cargo test
+          cargo clippy --all-targets -- -D warnings

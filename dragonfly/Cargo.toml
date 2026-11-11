@@ -1,0 +1,22 @@
+[package]
+name = "dragonfly"
+description = "The dragonfly CLI: Flutter apps written in NuclearLang (projects, generators, VS Code), on top of the Flutter CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "dragonfly"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+crossterm = "0.29"
+nuclear-diag.workspace = true
+nuclear-dialect.workspace = true
+nuclear-transpile.workspace = true
+png = "0.18"
+serde_json.workspace = true
+tungstenite = "0.27"
