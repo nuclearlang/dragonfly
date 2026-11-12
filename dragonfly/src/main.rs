@@ -1,4 +1,4 @@
-//! `dragonfly`: Flutter apps written in NuclearLang.
+//! `dragonfly`: mobile apps, web apps and backends written in NuclearLang.
 //!
 //! A project has only `.nuc` files (main.nuc, config/, shared/, components/, test/, integration_test/);
 //! everything generated goes to `build/`: the Flutter app (`build/app`) and the VS Code workspace
@@ -10,6 +10,7 @@ mod assets;
 mod device;
 mod doctor;
 mod explain;
+mod generate;
 mod landing;
 mod packages;
 mod scaffold;
@@ -55,7 +56,7 @@ backend (fastapi, nestjs; the dialect's [toolchain] runs in build/)
   repair                                     when the build or the app fails: build, then pub get + build_runner
                                              from scratch, then flutter clean + everything again, until
                                              flutter analyze finds no errors (exit 2: the .nuc have errors)
-  explain [--json]                           a Dart/Flutter run-time error (stdin) at its .nuc lines, explained
+  explain [--json]                           a run-time error or a test's output (stdin) at its .nuc lines, explained
 
 code generation: dragonfly make <what> ...   (alias: dragonfly g <alias> ...)
   component <component>                 (c)  facade + an example use case
@@ -77,6 +78,17 @@ code generation: dragonfly make <what> ...   (alias: dragonfly g <alias> ...)
   global <name>                         (gl) a global component (@on an event) + its event
   page <name> [--route /x|--not-found]  (pg) a screen shared by the app in shared/screens
   integration <name>                    (it) an integration test in integration_test/
+  backend and web projects: <kind> <component> <Name> [--screen <screen>]   any kind of the platform, at its
+      place (`nuclear help layout --platform <p>`), from the platform's skeleton (e.g. `make entity books Book`)
+
+finished code from a resource's data (every platform; ADR-0103): dragonfly gen <what> ...
+  inspect                               what the project has (components, declarations by kind), as JSON
+  component <component>                 a component and its facade
+  resource <component> <Name>           models, repository, a use case per action, the facade's aliases, the
+                                        controller (backend) or the screen (mobile, web), the tests
+      --from-json <file|url> | --from-spec <spec.md> | --fields \"id:int name:string origin:Origin?\"
+      [--source rest[:<base url>]|db] [--path p] [--actions list,get,search,create,update,delete]
+      [--screen <screen>] [--plural Names] [--dry-run]       (dragonfly gen alone prints every option)
 
 packages (config.nuc: the project's pubspec, written in Nuclear)
   flutter add <package>[:version]... [--dev]  add a package to config.nuc and the app, and generate its
@@ -119,6 +131,7 @@ fn main() -> ExitCode {
         }
         "new" | "n" => new_project(rest),
         "make" | "g" => with_root(project_dir, |root| make(root, rest)),
+        "gen" => with_root(project_dir, |root| gen_command(root, rest)),
         "check" => with_root(project_dir, |root| {
             // backend and web projects are checked by `nuclear` (it loads every dialect); the Flutter check below
             // resolves pubspec packages and fonts, which they do not have
@@ -585,6 +598,18 @@ fn backend_command(root: &Path, cmd: &str, m: &Manifest, rest: &[String], vars: 
         return Err(format!("the {} dialect has no toolchain.{cmd} (it has: {})", m.dialect, has.join(", ")));
     };
     let mut command = fill(command);
+    // a dependency that is a folder (`dependencies(lib = "../lib")`) keeps its version while its code changes: the
+    // package manager would keep the old copy, so `install_local` installs each one again
+    if cmd == "install"
+        && let Some(local) = dialect.tool("install_local")
+    {
+        for version in m.dependencies.values().filter(|v| v.starts_with('.') || v.starts_with('/')) {
+            let path = root.join(version);
+            let path = path.canonicalize().unwrap_or(path);
+            command.push_str(" && ");
+            command.push_str(&fill(&local.replace("{{path}}", &shell_quote(&path.display().to_string()))));
+        }
+    }
     let extra = passthrough(rest);
     if !extra.is_empty() {
         command.push(' ');
@@ -652,20 +677,59 @@ fn app_dir(root: &Path) -> Result<PathBuf, String> {
 // ---------------------------------------------------------------------------------------------------
 // create
 
+/// The platform and the dialect of `dragonfly new`: a dialect alone gives its platform; a platform alone gives its
+/// default dialect (platform.toml `default_dialect`); neither is mobile with its default.
+fn platform_and_dialect(platform: Option<String>, dialect: Option<String>) -> Result<(String, String), String> {
+    let l = loader();
+    let platform = match (platform, &dialect) {
+        (Some(p), _) => p,
+        (None, Some(d)) => l.load(d).0.and_then(|d| d.platform).ok_or_else(|| format!("unknown dialect '{d}' (nuclear dialect list)"))?,
+        (None, None) => MOBILE.into(),
+    };
+    let dialect = match dialect {
+        Some(d) => d,
+        None => l.default_dialect(&platform).ok_or_else(|| format!("unknown platform '{platform}' (mobile, backend, web)"))?,
+    };
+    Ok((platform, dialect))
+}
+
+/// A project name: letters, digits and `_` (written in snake_case); an option glued to it (`shop-p`) is refused.
+fn new_name(name: &str) -> Result<String, String> {
+    if let Some((_, flag)) = name.rsplit_once('-').filter(|(_, f)| ["p", "d", "-platform", "-dialect", "-org"].contains(f)) {
+        return Err(format!("'{name}' looks like a name with the option -{flag} glued to it: leave a space before it"));
+    }
+    let snake = scaffold::snake(name);
+    if snake.is_empty() || !snake.chars().next().is_some_and(|c| c.is_ascii_lowercase()) || !snake.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+        return Err(format!("'{name}' is not a project name: letters, digits and _, starting with a letter"));
+    }
+    Ok(snake)
+}
+
+/// Why a stray word of `dragonfly new` is there: most often a platform or a dialect without its option.
+fn hint_for(word: &str) -> String {
+    if ["mobile", "backend", "web"].contains(&word) {
+        format!("did you mean -p {word}?")
+    } else if loader().load(word).0.is_some() {
+        format!("did you mean -d {word}?")
+    } else {
+        "one name only".into()
+    }
+}
+
 /// `dragonfly new [-p mobile] [-d flutter] <name>`: a project of a platform, built with a dialect (ADR-0093).
 /// Only mobile/flutter gets its app created and built here; a backend project gets its `.nuc` skeleton and is
 /// built with `nuclear build .`.
 fn new_project(rest: Vec<String>) -> Result<(), String> {
     let mut rest = rest;
     let org = take_option(&mut rest, "--org").unwrap_or_else(|| "com.example".into());
-    let platform = take_option(&mut rest, "--platform").or_else(|| take_option(&mut rest, "-p")).unwrap_or_else(|| MOBILE.into());
-    // the platform's own default (platform.toml `default_dialect`) when no dialect is named
-    let dialect = match take_option(&mut rest, "--dialect").or_else(|| take_option(&mut rest, "-d")) {
-        Some(d) => d,
-        None => loader().default_dialect(&platform).ok_or_else(|| format!("unknown platform '{platform}' (mobile, backend, web)"))?,
-    };
-    let name = rest.first().ok_or("usage: dragonfly new <name> [-p mobile|backend|web] [-d flutter|fastapi|nestjs|react] [--org com.example]")?;
-    let name = scaffold::snake(name);
+    let platform = take_option(&mut rest, "--platform").or_else(|| take_option(&mut rest, "-p"));
+    let dialect = take_option(&mut rest, "--dialect").or_else(|| take_option(&mut rest, "-d"));
+    let (platform, dialect) = platform_and_dialect(platform, dialect)?;
+    let usage = "usage: dragonfly new <name> [-p mobile|backend|web] [-d flutter|fastapi|nestjs|react] [--org com.example]";
+    let name = new_name(rest.first().ok_or(usage)?)?;
+    if let Some(extra) = rest.get(1) {
+        return Err(format!("unexpected argument '{extra}' ({})\n{usage}", hint_for(extra)));
+    }
     let root = PathBuf::from(&name);
     if root.join(packages::CONFIG).exists() {
         return Err(format!("{} already has a config.nuc", root.display()));
@@ -701,8 +765,9 @@ fn new_project(rest: Vec<String>) -> Result<(), String> {
             eprintln!("{} {e}", landing::dim("agent files not written:"));
         }
         eprintln!("\n{} {platform} project {} created. Next:", landing::ok("✓"), landing::name(&name));
-        eprintln!("  {}", landing::cmd(&format!("cd {name} && nuclear build .")));
-        eprintln!("  {}", landing::dim("then in build/: the dialect's run and test commands (nuclear help backend)"));
+        eprintln!("  {}", landing::cmd(&format!("cd {name} && dragonfly build && dragonfly install")));
+        eprintln!("  {}   {}", landing::cmd("dragonfly run"), landing::dim("(dragonfly test runs the tests)"));
+        eprintln!("  {}", landing::dim("add pieces with: dragonfly make <kind> <component> <Name>"));
         return Ok(());
     }
     let report = scaffold::write(&root, &scaffold::project(&name)).map_err(|e| e.to_string())?;
@@ -835,10 +900,22 @@ fn pub_get(app: &Path) -> Result<(), String> {
 /// `dragonfly explain`: reads the error from stdin.
 fn explain_command(root: &Path, json: bool) -> Result<(), String> {
     use std::io::Read;
-    let app = app_dir(root)?;
+    // backend and web: the output folder and the line map every project build writes; mobile: the Flutter app's
+    let (app, map_file) = match non_mobile_manifest(root)? {
+        Some(m) => {
+            let (dialect, _) = loader().load(&m.dialect);
+            let dialect = dialect.ok_or_else(|| format!("dialect '{}' could not be loaded", m.dialect))?;
+            let out = root.join(project::output_dir(&m, &dialect));
+            (out.clone(), out.join(project::LINE_MAP_FILE))
+        }
+        None => {
+            let app = app_dir(root)?;
+            (app.clone(), app.join(LINE_MAP))
+        }
+    };
     let mut text = String::new();
     std::io::stdin().read_to_string(&mut text).map_err(|e| e.to_string())?;
-    let map: serde_json::Value = std::fs::read_to_string(app.join(LINE_MAP))
+    let map: serde_json::Value = std::fs::read_to_string(map_file)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .ok_or("no line map yet: run `dragonfly build` first")?;
@@ -1121,6 +1198,9 @@ fn generator(word: &str) -> Option<&'static str> {
 
 fn make(root: &Path, rest: Vec<String>) -> Result<(), String> {
     let mut rest = rest;
+    if let Some(m) = non_mobile_manifest(root)? {
+        return make_from_layout(root, &m, rest);
+    }
     let route = take_option(&mut rest, "--route");
     let manager = take_option(&mut rest, "--manager").or_else(|| take_option(&mut rest, "-m"));
     let state = take_option(&mut rest, "--state").or_else(|| take_option(&mut rest, "-st"));
@@ -1179,8 +1259,332 @@ fn make(root: &Path, rest: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// `dragonfly make <kind> <component> <Name> [--screen <s>]` in a backend or web project: the platform's skeleton of
+/// the kind (`[skeletons]` of platform.toml) at its place (`[layout]`), the same for every dialect of the platform.
+fn make_from_layout(root: &Path, m: &Manifest, rest: Vec<String>) -> Result<(), String> {
+    let mut rest = rest;
+    let screen = take_option(&mut rest, "--screen").map(|s| scaffold::snake(&s)).unwrap_or_else(|| "widgets".into());
+    let (dialect, _) = loader().load(&m.dialect);
+    let d = dialect.ok_or_else(|| format!("dialect '{}' could not be loaded", m.dialect))?;
+    let platform = m.platform.clone().unwrap_or_default();
+    let kinds: Vec<&String> = d.skeletons.keys().collect();
+    let usage = || {
+        format!(
+            "usage: dragonfly make <kind> <component> <Name> [--screen <screen>]\nkinds of the {platform} platform: {}",
+            kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+        )
+    };
+    let [kind, component, name] = rest.as_slice() else { return Err(usage()) };
+    let kind = generator(kind).filter(|k| d.skeletons.contains_key(*k)).map(str::to_string).unwrap_or_else(|| kind.clone());
+    let (Some(skeleton), Some(place)) = (d.skeletons.get(&kind), d.layout.get(&kind)) else { return Err(usage()) };
+    let name = scaffold::pascal(&scaffold::snake(name));
+    let component = scaffold::snake(component);
+    let file = scaffold::snake(&name);
+    let camel = format!("{}{}", name[..1].to_lowercase(), &name[1..]);
+    let rel = place.replace("{component}", &component).replace("{screen}", &screen).replace("{file}", &file);
+    let text = skeleton
+        .replace("{{Name}}", &name)
+        .replace("{{name}}", &camel)
+        .replace("{{Component}}", &scaffold::pascal(&component))
+        .replace("{{component}}", &component)
+        .replace("{{table}}", &format!("{file}s"));
+    let report = scaffold::write(root, &vec![(PathBuf::from(&rel), text)]).map_err(|e| e.to_string())?;
+    eprintln!("{}", report.join("\n"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------------
+// gen (ADR-0103): finished code from a resource's data, from the platform's [[generators]]
+
+const GEN_USAGE: &str = "usage:
+  dragonfly gen inspect                                   what the project has: components and declarations (JSON)
+  dragonfly gen component <component>                     a component: its facade and its config
+  dragonfly gen resource <component> <Name> [options]     models, repository, a use case per action, the facade's
+                                                          aliases, the controller (backend) or the screen (mobile,
+                                                          web), the tests
+options of gen resource:
+  --from-json <file|url>     the fields from an example answer of the API (a url also gives --source rest)
+  --from-spec <spec.md>      the fields from the spec's Key | Type | Description table
+  --fields \"id:int name:string origin:Origin?\"
+  --source rest:<base url> | rest | db     another API (an HTTP repository) or the database (default: db; rest with a url)
+  --path <path>              the API's path of the resource (default: the url's last segment, or the name)
+  --actions list,get,search,create,update,delete   (default: list,get for rest; every one for db)
+  --screen <screen>          mobile and web: a screen that lists the resource
+  --plural <Names>           when the English plural is not the right one
+  --dry-run                  show the files, write nothing";
+
+fn fetch_text(source: &str) -> Result<String, String> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let out = Command::new("curl").args(["-fsSL", "--max-time", "20", source]).output().map_err(|e| format!("curl: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("{source} answered {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        std::fs::read_to_string(source).map_err(|e| format!("{source}: {e}"))
+    }
+}
+
+/// The `Http` connection a REST resource calls, written in the app's connections when it is missing with the
+/// platform's `[gen] http` form (or `http_named` when the app has another one). Answers the place it changed and the
+/// connection's name for `@repository(connection = ...)` ("" for the default one).
+fn ensure_http(root: &Path, d: &nuclear_dialect::Dialect, base: &str, name: &str, dry: bool) -> Result<(Option<String>, String), String> {
+    let Some(place) = d.layout.get("appConfig") else { return Ok((None, String::new())) };
+    let file = root.join(place);
+    let Ok(text) = std::fs::read_to_string(&file) else { return Ok((None, String::new())) };
+    // already there: its name, if it has one
+    let quoted = format!("\"{}", base.trim_end_matches('/'));
+    if let Some(at) = text.find(&quoted) {
+        let line = text[..at].rsplit('\n').next().unwrap_or("");
+        let named = ["connectionName = \"", "name = \""].iter().find_map(|k| line.split(k).nth(1).and_then(|r| r.split('"').next()));
+        return Ok((None, named.unwrap_or("").to_string()));
+    }
+    let has_http = text.contains("Http(");
+    let (form, connection) = match (has_http, d.gen_values.get("http"), d.gen_values.get("http_named")) {
+        (false, Some(f), _) => (f, String::new()),
+        (true, _, Some(f)) => (f, name.to_string()),
+        _ => return Ok((None, String::new())),
+    };
+    let line = form.replace("{{baseUrl}}", base).replace("{{name}}", name);
+    let Some(at) = text.find("connections: Connection[] = [") else { return Ok((None, connection)) };
+    let line_end = at + text[at..].find('\n').unwrap_or(text.len() - at);
+    if !dry {
+        let new = format!("{}\n    {line},{}", &text[..line_end], &text[line_end..]);
+        std::fs::write(&file, new).map_err(|e| e.to_string())?;
+    }
+    Ok((Some(place.clone()), connection))
+}
+
+fn gen_command(root: &Path, rest: Vec<String>) -> Result<(), String> {
+    let mut rest = rest;
+    let dry = rest.iter().any(|a| a == "--dry-run");
+    rest.retain(|a| a != "--dry-run");
+    let m = any_manifest(root)?;
+    let (dialect, _) = loader().load(&m.dialect);
+    let d = dialect.ok_or_else(|| format!("dialect '{}' could not be loaded", m.dialect))?;
+    let what = rest.first().cloned().ok_or(GEN_USAGE)?;
+    // a component that does not exist is created first (after the checks below)
+    let mut new_component: Option<String> = None;
+    let mut http_base: Option<(String, String)> = None;
+    let ctx = match what.as_str() {
+        "inspect" => {
+            let all = nuclear_transpile::map::inventory(root, &m, &d);
+            let mut components: std::collections::BTreeMap<String, Vec<serde_json::Value>> = Default::default();
+            for x in all {
+                components.entry(x.component.clone()).or_default().push(serde_json::json!({ "kind": x.kind, "name": x.name, "file": x.file }));
+            }
+            let json = serde_json::json!({
+                "platform": m.platform, "dialect": m.dialect,
+                "components": components.iter().filter(|(c, _)| !c.is_empty()).map(|(c, decls)| serde_json::json!({ "name": c, "declarations": decls })).collect::<Vec<_>>(),
+                "outside": components.get("").cloned().unwrap_or_default(),
+                "generators": d.generators.keys().collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+            return Ok(());
+        }
+        "component" => {
+            let c = rest.get(1).ok_or(GEN_USAGE)?;
+            let c = scaffold::snake(c);
+            nuclear_dialect::template::Value::Map(std::collections::BTreeMap::from([
+                ("component".into(), nuclear_dialect::template::Value::Str(c.clone())),
+                ("Component".into(), nuclear_dialect::template::Value::Str(scaffold::pascal(&c))),
+            ]))
+        }
+        "resource" => {
+            let from_json = take_option(&mut rest, "--from-json");
+            let from_spec = take_option(&mut rest, "--from-spec");
+            let fields = take_option(&mut rest, "--fields");
+            let source = take_option(&mut rest, "--source");
+            let path = take_option(&mut rest, "--path");
+            let actions = take_option(&mut rest, "--actions");
+            let screen = take_option(&mut rest, "--screen");
+            let plural = take_option(&mut rest, "--plural");
+            let [_, component, name] = rest.as_slice() else { return Err(GEN_USAGE.into()) };
+            let name = scaffold::pascal(&scaffold::snake(name));
+            let component = scaffold::snake(component);
+            let (models, page) = match (&from_json, &fields, &from_spec) {
+                (Some(src), _, _) => {
+                    let text = fetch_text(src)?;
+                    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{src} is not JSON: {e}"))?;
+                    generate::from_json(&json, &name)?
+                }
+                (None, Some(f), _) => (vec![generate::Model { name: name.clone(), fields: generate::parse_fields(f)? }], None),
+                // a spec's example answer gives the nested models and the page; else its Key | Type table
+                (None, None, Some(spec)) => {
+                    let text = fetch_text(spec)?;
+                    match (generate::spec_json(&text), generate::from_spec(&text, &name)) {
+                        (Some(json), _) => generate::from_json(&json, &name)?,
+                        (None, Ok(model)) => (vec![model], None),
+                        // objects the table does not detail: the API's own answer, from the spec's GET line
+                        (None, Err(e)) => match generate::spec_url(&text) {
+                            Some(url) => {
+                                let answer = fetch_text(&url)?;
+                                generate::from_json(&serde_json::from_str(&answer).map_err(|e| format!("{url} is not JSON: {e}"))?, &name)?
+                            }
+                            None => return Err(e),
+                        },
+                    }
+                }
+                _ => return Err(format!("the fields of {name}: --from-json <an example answer of the API, a file or its url>, --from-spec <spec.md with a Key | Type table> or --fields \"id:int name:string\" (an agent finds them in the spec, the API's answer or its documentation, or asks)")),
+            };
+            // every type a field names must be known: basic, a model of this answer, or declared in the project
+            let declared: Vec<String> = nuclear_transpile::map::inventory(root, &m, &d).into_iter().map(|x| x.name).collect();
+            for f in models.iter().flat_map(|x| &x.fields) {
+                let ty = f.ty.trim_end_matches("[]");
+                if !generate::BASIC.contains(&ty) && !models.iter().any(|x| x.name == ty) && !declared.iter().any(|x| x == ty) {
+                    return Err(format!("{}: the type {ty} is not declared (declare the model first, e.g. `dragonfly gen resource ... --fields` for it, or take the fields from --from-json, which makes nested models)", f.name));
+                }
+            }
+            // a url example answer is also where the resource lives: its base and its path
+            let spec_url = from_spec.as_ref().and_then(|f| fetch_text(f).ok()).and_then(|t| generate::spec_url(&t));
+            let url = from_json.as_ref().filter(|u| u.starts_with("http")).or(spec_url.as_ref()).map(|u| u.split('?').next().unwrap_or(u).trim_end_matches('/').to_string());
+            let source = match source.as_deref() {
+                Some("db") => generate::Source::Db,
+                Some(s) if s.starts_with("rest") => {
+                    let base = s.strip_prefix("rest:").map(str::to_string).or_else(|| url.as_ref().and_then(|u| u.rsplit_once('/').map(|(b, _)| b.to_string())));
+                    let p = path.clone().or_else(|| url.as_ref().and_then(|u| u.rsplit_once('/').map(|(_, p)| p.to_string()))).unwrap_or_else(|| scaffold::snake(&name));
+                    generate::Source::Rest { base, path: p }
+                }
+                Some(other) => return Err(format!("--source {other}: rest:<base url>, rest or db")),
+                None => match &url {
+                    Some(u) => {
+                        let (b, p) = u.rsplit_once('/').unwrap_or((u, ""));
+                        generate::Source::Rest { base: Some(b.to_string()), path: path.clone().unwrap_or_else(|| p.to_string()) }
+                    }
+                    None => generate::Source::Db,
+                },
+            };
+            if matches!(source, generate::Source::Db) && let Some(f) = models[0].fields.iter().find(|f| !generate::BASIC.contains(&f.ty.trim_end_matches("[]"))) {
+                return Err(format!("{}: a database resource takes columns of basic types; a relation to {} is written by hand (`@manyToOne`, spec/backend.md)", f.name, f.ty));
+            }
+            let actions: Vec<String> = match actions {
+                Some(a) => a.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+                None if matches!(source, generate::Source::Rest { .. }) => vec!["list".into(), "get".into()],
+                None => generate::ACTIONS.iter().filter(|a| **a != "search").map(|a| a.to_string()).collect(),
+            };
+            if let Some(bad) = actions.iter().find(|a| !generate::ACTIONS.contains(&a.as_str())) {
+                return Err(format!("unknown action '{bad}' (actions: {})", generate::ACTIONS.join(", ")));
+            }
+            let r = generate::Resource {
+                plural: plural.unwrap_or_else(|| generate::plural(&name)),
+                name,
+                component: component.clone(),
+                models,
+                page,
+                source: source.clone(),
+                actions,
+                screen: screen.map(|s| scaffold::snake(&s)),
+            };
+            // a source the platform has no pieces for (mobile and web keep no database of resources) is refused
+            let wanted = if matches!(source, generate::Source::Db) { "db" } else { "rest" };
+            if !d.generators.get("resource").is_some_and(|ps| ps.iter().any(|p| p.when.as_deref() == Some(wanted))) {
+                return Err(format!("the {} platform generates no `{wanted}` resources: {}", m.platform.as_deref().unwrap_or("?"), if wanted == "db" { "give the API: --source rest:<base url> or --from-json <url>" } else { "use --source db" }));
+            }
+            let mut connection = String::new();
+            if let generate::Source::Rest { base: Some(b), .. } = &source {
+                // only its name now: the connection is written after the checks
+                connection = ensure_http(root, &d, b, &component, true)?.1;
+                http_base = Some((b.clone(), component.clone()));
+            }
+            new_component = (!root.join("components").join(&component).is_dir() && d.generators.contains_key("component")).then(|| component.clone());
+            let mut ctx = generate::context(&r);
+            if let nuclear_dialect::template::Value::Map(m) = &mut ctx && !connection.is_empty() {
+                m.insert("connection".into(), nuclear_dialect::template::Value::Str(connection));
+            }
+            ctx
+        }
+        _ => return Err(GEN_USAGE.into()),
+    };
+    let files = generate::plan(&d, &what, &ctx)?;
+    // a name a new file declares that another file of the project already declares (N0303): stop before writing
+    let declared = nuclear_transpile::map::inventory(root, &m, &d);
+    for (path, _, _) in files.iter().filter(|(p, _, merge)| !merge && !root.join(p).exists()) {
+        let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("");
+        if let Some(x) = declared.iter().find(|x| scaffold::snake(&x.name) == stem) {
+            return Err(format!("{} is already declared in {}: remove or rename it, or generate another name", x.name, x.file));
+        }
+    }
+    if dry {
+        for (p, text, _) in &files {
+            println!("── {}\n{text}", p.display());
+        }
+        return Ok(());
+    }
+    if let Some((base, name)) = http_base
+        && let (Some(place), _) = ensure_http(root, &d, &base, &name, false)?
+    {
+        eprintln!("  {}  {}", landing::dim("added to"), place);
+    }
+    if let Some(c) = new_component {
+        gen_command(root, vec!["component".into(), c])?;
+    }
+    for (file, how) in generate::write(root, &files).map_err(|e| e.to_string())? {
+        eprintln!("  {:>9}  {file}", if how == "created" { landing::ok(how) } else { landing::dim(how) });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// ADR-0103: what `dragonfly gen` writes compiles with every dialect of every platform (a REST resource with a
+    /// nested model and a screen; a database resource in the backend). No network: the fields come from --fields.
+    #[test]
+    fn a_generated_resource_compiles_with_every_dialect() {
+        let l = loader();
+        for (dialect, files, db) in [
+            ("flutter", scaffold::project("demo_app"), false),
+            ("fastapi", scaffold::backend_project("demo_api", "fastapi"), true),
+            ("nestjs", scaffold::backend_project("demo_api", "nestjs"), true),
+            ("react", scaffold::web_project("demo_web", "react", "http://localhost:8000"), false),
+        ] {
+            let Some(d) = l.load(dialect).0 else {
+                eprintln!("skipped {dialect}: its platform repository is not in this working tree");
+                continue;
+            };
+            let root = std::env::temp_dir().join(format!("dragonfly-gen-{dialect}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for (path, text) in &files {
+                let f = root.join(path);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(f, text).unwrap();
+            }
+            let args = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+            // a model the fields name must exist first: a type nobody declared is refused
+            let origin = root.join(d.layout["model"].replace("{component}", "characters").replace("{file}", "character_origin"));
+            let refused = gen_command(&root, args(&["resource", "characters", "Character", "--fields", "id:int origin:CharacterOrigin", "--source", "rest:https://example.com/api"]));
+            assert!(refused.is_err_and(|e| e.contains("CharacterOrigin")), "{dialect}");
+            std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
+            std::fs::write(&origin, "CharacterOrigin\n  name: string\n").unwrap();
+            gen_command(&root, args(&["resource", "characters", "Character", "--fields", "id:int name:string origin:CharacterOrigin tags:string[] note?:string", "--source", "rest:https://example.com/api", "--actions", "list,get,search,create,update,delete", "--screen", "characters"])).unwrap();
+            if db {
+                gen_command(&root, args(&["resource", "catalog", "Book", "--fields", "title:string year:int", "--source", "db"])).unwrap();
+            }
+            let m = nuclear_transpile::project::Manifest::read(&root).unwrap();
+            let out = nuclear_transpile::project::build(&root, &m, &d);
+            let errors: Vec<String> = out
+                .files
+                .iter()
+                .flat_map(|f| f.diagnostics.iter().filter(|x| x.is_error()).map(move |x| format!("{}: {}", f.source_path.display(), x.message)))
+                .collect();
+            assert!(errors.is_empty(), "{dialect}: {errors:?}");
+            assert!(out.files.iter().any(|f| f.source_path.ends_with("character_repository.nuc")), "{dialect}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn new_reads_the_platform_from_the_dialect_and_refuses_typos() {
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(platform_and_dialect(None, s("nestjs")).unwrap(), ("backend".into(), "nestjs".into()));
+        assert_eq!(platform_and_dialect(s("web"), None).unwrap().0, "web");
+        assert!(platform_and_dialect(None, None).unwrap().0 == MOBILE);
+        assert!(new_name("nuclear_rick_and_morty-p").unwrap_err().contains("-p glued"));
+        assert!(new_name("2shop").is_err());
+        assert_eq!(new_name("ShopApp").unwrap(), "shop_app");
+        assert!(hint_for("backend").contains("-p backend"));
+        assert!(hint_for("nestjs").contains("-d nestjs"));
+    }
 
     #[test]
     fn a_placeholder_is_one_shell_word() {
@@ -1194,6 +1598,33 @@ mod tests {
     }
 
     use super::*;
+
+    /// `dragonfly make` writes every kind of the backend and web platforms at its layout place, and the project
+    /// compiles (a kind of a plugin the project does not enable is N0304, which says the line to add).
+    #[test]
+    fn make_writes_every_kind_where_the_platform_says() {
+        for (platform, dialect) in [("backend", "fastapi"), ("backend", "nestjs"), ("web", "react")] {
+            let Some(d) = loader().load(dialect).0 else { continue };
+            let root = std::env::temp_dir().join(format!("dragonfly-make-{dialect}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let files = if platform == "web" { scaffold::web_project("demo", dialect, "http://localhost:8000") } else { scaffold::backend_project("demo", dialect) };
+            scaffold::write(&root, &files).unwrap();
+            let m = Manifest::read(&root).unwrap();
+            for kind in d.skeletons.keys() {
+                let name = format!("Demo{}", scaffold::pascal(kind));
+                make_from_layout(&root, &m, vec![kind.clone(), "shelf".into(), name, "--screen".into(), "list".into()]).unwrap();
+            }
+            let out = project::build(&root, &m, &d);
+            let errors: Vec<String> = out
+                .files
+                .iter()
+                .flat_map(|f| f.diagnostics.iter().filter(|x| x.is_error() && x.code.id != "N0304").map(move |x| format!("{}: {}", f.source_path.display(), x.message)))
+                .collect();
+            assert!(errors.is_empty(), "{dialect}: {errors:?}");
+            assert!(root.join("components/shelf/domain/usecases/demo_usecase.nuc").is_file(), "{dialect}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
 
     #[test]
     fn pub_get_after_clean() {

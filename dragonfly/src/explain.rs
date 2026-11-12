@@ -1,7 +1,9 @@
-//! `dragonfly explain`: a Dart/Flutter run-time error (on stdin) told in Nuclear terms: its message, a short
-//! explanation and the `.nuc` lines of its stack, from the line map `dragonfly build` writes
-//! (`build/app/.dart_tool/nuclear_lines.json`). The editors call it with `--json` to show the error at its
-//! `.nuc` line; in a terminal it prints `file.nuc:line` rows.
+//! `dragonfly explain`: a run-time error or a failing test's output (on stdin) told in Nuclear terms: its message, a
+//! short explanation and the `.nuc` lines of its stack, from the line map of the build (mobile:
+//! `build/app/.dart_tool/nuclear_lines.json`; backend and web: `<output>/.nuclear/lines.json`). Dart, Python and
+//! JavaScript/TypeScript stacks are read. The editors call it with `--json` to show the error at its `.nuc` line, and
+//! the Loop's local agents read it instead of the raw log (they know only Nuclear); in a terminal it prints
+//! `file.nuc:line` rows. The raw output is never changed.
 
 use serde_json::{Value, json};
 use std::path::Path;
@@ -55,10 +57,31 @@ const HINTS: &[(&[&str], &str)] = &[
     ),
     (&["FormatException"], "A text could not be read as the expected format (JSON, number or date)."),
     (&["Bad state: No element"], "`first`, `last` or `single` on an empty collection."),
-    (&["Stack Overflow"], "A function calls itself without end (or two functions call each other)."),
+    (&["Stack Overflow", "RecursionError", "Maximum call stack size exceeded"], "A function calls itself without end (or two functions call each other)."),
+    // backend and web (the target's own words, said in Nuclear's)
+    (
+        &["AssertionError", "AssertionError [ERR_ASSERTION]", "expect(received)"],
+        "A test's `expect` failed: the code returned another value than the test expects. Read the expected and the \
+         received values, then fix the code (or the test, if the test is wrong).",
+    ),
+    (
+        &["has no attribute", "is not a function", "Cannot read properties of undefined"],
+        "A member that does not exist was called: a name written wrong, or a value that is not what the code thinks \
+         (type the value, or check the name in the project map).",
+    ),
+    (
+        &["NoneType", "of null", "of undefined"],
+        "A value was null when this line ran: check `?`, `!` and `??` here.",
+    ),
+    (&["KeyError", "IndexError"], "A key or an index that the map or the list does not have."),
+    (
+        &["ValidationError", "BadRequestException", "422"],
+        "The data did not meet the model's rules (`@minLength`, `@email`...): the request or the test sends invalid data.",
+    ),
+    (&["IntegrityError", "UNIQUE constraint failed", "SequelizeUniqueConstraintError"], "A row breaks a `unique` column or a relation."),
 ];
 
-const NO_HINT: &str = "The Dart error happened while running the code generated from this Nuclear line.";
+const NO_HINT: &str = "The error happened while running the code generated from this Nuclear line.";
 
 pub fn hint(text: &str) -> &'static str {
     HINTS.iter().find(|(keys, _)| keys.iter().any(|k| text.contains(k))).map_or(NO_HINT, |(_, h)| h)
@@ -72,6 +95,14 @@ pub fn title(text: &str) -> String {
     if let Some(r) = rows.iter().find_map(|r| r.split_once("Unhandled Exception:")) {
         return r.1.trim().to_string();
     }
+    // a test runner's summary of a failed test: `FAILED tests/x.py::T::test_a - assert 0 > 0` (pytest), `✖ name` (node)
+    if let Some(r) = rows.iter().find_map(|r| r.strip_prefix("FAILED ")) {
+        return r.split_once(" - ").map_or(r, |(_, why)| why).trim().to_string();
+    }
+    // Python (pytest's `E   X: message` too) and Node: the first `SomethingError: message` / `...Exception: message`
+    if let Some(r) = rows.iter().map(|r| r.strip_prefix("E ").map_or(*r, str::trim)).find(|r| error_line(r)) {
+        return r.to_string();
+    }
     rows.iter()
         .find(|l| {
             !l.contains("EXCEPTION CAUGHT BY")
@@ -83,18 +114,56 @@ pub fn title(text: &str) -> String {
         .map_or_else(|| "Error".into(), |l| l.to_string())
 }
 
-/// Every `x.dart:12` / `x.dart:12:5` / `x.dart 12:5` of the text: (frame name, file reference, line).
+/// The source extensions whose lines a stack names.
+const SOURCES: &[&str] = &[".dart", ".py", ".ts", ".tsx", ".js", ".mjs"];
+
+/// `AttributeError: ...`, `AssertionError [ERR_ASSERTION]: ...`, `app.errors.NotFound: ...`: a name ending in Error or
+/// Exception (dots allowed), an optional `[CODE]`, then `:`.
+fn error_line(row: &str) -> bool {
+    let Some((head, _)) = row.split_once(':') else { return false };
+    let name = head.split(' ').next().unwrap_or("");
+    let rest = head[name.len()..].trim();
+    (name.ends_with("Error") || name.ends_with("Exception"))
+        && name.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_')
+        && (rest.is_empty() || (rest.starts_with('[') && rest.ends_with(']')))
+}
+
+/// Every place of a stack in the text: `x.dart:12[:5]`, `x.dart 12:5`, `x.ts:12:5` (Node: `at name (file:12:5)`) and
+/// Python's `File "x.py", line 12, in name`: (frame name, file reference, line).
 pub fn locations(text: &str) -> Vec<(String, String, u32)> {
     let mut out = Vec::new();
     for row in text.lines() {
+        // Python: File "/p/build/app/x.py", line 12, in name
+        if let Some(rest) = row.trim().strip_prefix("File \"")
+            && let Some((file, after)) = rest.split_once('"')
+            && let Some(after) = after.strip_prefix(", line ")
+        {
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            let name = after.split_once(", in ").map_or(String::new(), |(_, n)| n.trim().to_string());
+            if let Ok(line) = digits.parse() {
+                out.push((name, file.to_string(), line));
+            }
+            continue;
+        }
+        // Node: `at Name.method (/p/build/src/x.ts:12:5)`
+        let node_name = row.trim().strip_prefix("at ").and_then(|r| r.rsplit_once(" (")).map(|(n, _)| n.trim().to_string());
         let name = row
             .trim()
             .strip_prefix('#')
             .and_then(|r| r.trim_start_matches(|c: char| c.is_ascii_digit()).trim().rsplit_once(" ("))
-            .map_or(String::new(), |(n, _)| n.trim().to_string());
+            .map(|(n, _)| n.trim().to_string())
+            .or(node_name)
+            .unwrap_or_default();
         let mut from = 0;
-        while let Some(at) = row[from..].find(".dart") {
-            let end = from + at + ".dart".len();
+        while let Some((at, ext)) =
+            SOURCES.iter().filter_map(|e| row[from..].find(e).map(|i| (i, *e))).min_by_key(|(i, e)| (*i, usize::MAX - e.len()))
+        {
+            let end = from + at + ext.len();
+            // `.ts` inside `.tsx`, `.js` inside `.json`: the extension ends at a word boundary
+            if row[end..].starts_with(|c: char| c.is_alphanumeric()) {
+                from = end;
+                continue;
+            }
             let start = row[..end].rfind(|c: char| c.is_whitespace() || c == '(').map_or(0, |i| i + 1);
             let rest = &row[end..];
             let digits: String = rest.chars().skip(1).take_while(char::is_ascii_digit).collect();
@@ -190,5 +259,30 @@ Null check operator used on a null value
         let web = "packages/a/x.dart 3:1  f";
         assert_eq!(locations(web), [(String::new(), "packages/a/x.dart".into(), 3)]);
         assert_eq!(app_relative(Path::new("/p/build/app"), "packages/a/x.dart").as_deref(), Some("lib/x.dart"));
+    }
+
+    #[test]
+    fn a_python_traceback_points_to_its_nuc_lines() {
+        let summary = explain(Path::new("/p"), Path::new("/p/build"), &json!({}), "$ nuclear build .\nFAILED tests/books_test.py::TestBooks::test_by_author - assert 0 > 0\n");
+        assert_eq!(summary["title"], "assert 0 > 0");
+        let trace = "Traceback (most recent call last):\n  File \"/p/build/app/components/books/domain/usecases/books_of.py\", line 14, in exec\n    return await self.books.by_author(author)\nAttributeError: 'BookRepository' object has no attribute 'by_author'\n";
+        let map = json!({ "files": { "app/components/books/domain/usecases/books_of.py": { "source": "components/books/domain/usecases/books_of.nuc", "lines": [[10, 2], [14, 3]] } } });
+        let got = explain(Path::new("/p"), Path::new("/p/build"), &map, &format!("$ nuclear build .\n{trace}"));
+        assert_eq!(got["title"], "AttributeError: 'BookRepository' object has no attribute 'by_author'");
+        assert!(got["hint"].as_str().unwrap().contains("does not exist"), "{got}");
+        assert_eq!(got["frames"][0]["line"], 3);
+        assert_eq!(got["frames"][0]["name"], "exec");
+        assert!(got["frames"][0]["source"].as_str().unwrap().ends_with("books_of.nuc"));
+    }
+
+    #[test]
+    fn a_node_stack_points_to_its_nuc_lines() {
+        let trace = "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal\n    at TestContext.<anonymous> (/p/build/src/components/books/books.test.ts:21:5)\n    at node:internal/test_runner\n";
+        let map = json!({ "files": { "src/components/books/books.test.ts": { "source": "test/books_test.nuc", "lines": [[20, 7]] } } });
+        let got = explain(Path::new("/p"), Path::new("/p/build"), &map, trace);
+        assert_eq!(got["title"], "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal");
+        assert!(got["hint"].as_str().unwrap().contains("`expect` failed"), "{got}");
+        assert_eq!(got["frames"][0]["line"], 7);
+        assert_eq!(got["frames"][0]["name"], "TestContext.<anonymous>");
     }
 }

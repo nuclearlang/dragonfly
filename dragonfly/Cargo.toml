@@ -17,6 +17,7 @@ crossterm = "0.29"
 nuclear-diag.workspace = true
 nuclear-dialect.workspace = true
 nuclear-transpile.workspace = true
+nuclear-syntax.workspace = true
 png = "0.18"
 serde_json.workspace = true
 tungstenite = "0.27"

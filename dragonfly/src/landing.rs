@@ -139,8 +139,8 @@ pub fn header() {
         }
     }
     c.ink_text(64, 1, "Dragonfly", Some(PURPLE), BOLD);
-    c.ink_text(64, 2, "Flutter apps in", None, NORMAL);
-    c.ink_text(64, 3, "NuclearLang", None, NORMAL);
+    c.ink_text(64, 2, "Mobile, web and", None, NORMAL);
+    c.ink_text(64, 3, "backend in Nuclear", None, NORMAL);
     c.ink_text(64, 4, concat!("v", env!("CARGO_PKG_VERSION")), None, FAINT);
     eprintln!("{}", c.render(std::env::var_os("NO_COLOR").is_none()));
 }
@@ -628,7 +628,7 @@ fn page(c: &mut Canvas, x0: i32, h: f32, credits: bool) {
         (21, 4, "Write only the logic;", None, FAINT),
         (21, 5, "transpilers do the rest.", None, FAINT),
         (0, 10, "Dragonfly", Some(PURPLE), BOLD),
-        (0, 11, "Flutter apps written in NuclearLang", None, NORMAL),
+        (0, 11, "Mobile, web and backend in NuclearLang", None, NORMAL),
         (0, 12, concat!("v", env!("CARGO_PKG_VERSION")), None, FAINT),
         (0, 13, "────────────────────────────────────────", None, FAINT),
     ];

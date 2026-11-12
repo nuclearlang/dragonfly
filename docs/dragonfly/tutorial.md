@@ -95,6 +95,18 @@ rm components/products/domain/usecases/hello_products_usecase.nuc   # the sample
 
 `dragonfly help` lists every generator and its aliases.
 
+A resource that follows from its data is generated whole, already compiling: its models, the repository, a use case
+per action, the facade's aliases and the screen (mobile, web) or the controller (backend). The fields come from an
+example answer of the API, from the spec's table, or from `--fields`:
+
+```sh
+dragonfly gen resource characters Character --from-json https://rickandmortyapi.com/api/character --screen characters
+dragonfly gen resource catalog Book --fields "title:string author:string year:int" --source db   # backend
+dragonfly gen inspect                   # what the project has, as JSON
+```
+
+Write by hand only what is yours: a use case with its own rules, the details of a view.
+
 ## 3. Write the business logic
 
 **The API**, in `config/project_config.nuc`:

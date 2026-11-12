@@ -160,6 +160,7 @@ dependencies = [
  "crossterm",
  "nuclear-diag",
  "nuclear-dialect",
+ "nuclear-syntax",
  "nuclear-transpile",
  "png",
  "serde_json",

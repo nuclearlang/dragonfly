@@ -107,7 +107,7 @@ stateless {Screen}Screen
       appBar = AppBar(title = Text("{Screen}")),
       body = {State}Builder<{Manager}>(
         loading = () => Center(child = CircularProgressIndicator()),
-        items = (items) => ListView(children = items.map(i => ListTile(title = Text(i))).toList()),
+        items = (items) => ListView(children = items.map(i => ListTile(title = Text(i)))),
         error = (message) => Center(child = Text(message)),
       ),
     )
@@ -485,6 +485,40 @@ mod tests {
         for (path, text) in files.iter().filter(|(p, _)| p.extension().is_some_and(|e| e == "nuc")) {
             let parsed = nuclear_syntax_check(text);
             assert!(parsed.is_empty(), "{}: {parsed:?}", path.display());
+        }
+    }
+
+    /// What `dragonfly new` writes compiles with its dialect, not only parses (a target name such as `toList` in the
+    /// mobile skeleton passed the parse and failed every new project's check).
+    #[test]
+    fn every_new_project_compiles_with_its_dialect() {
+        let l = crate::loader();
+        for (dialect, files) in [
+            ("flutter", project("demo_app")),
+            ("fastapi", backend_project("demo_api", "fastapi")),
+            ("nestjs", backend_project("demo_api", "nestjs")),
+            ("react", web_project("demo_web", "react", "http://localhost:8000")),
+        ] {
+            let Some(d) = l.load(dialect).0 else {
+                eprintln!("skipped {dialect}: its platform repository is not in this working tree");
+                continue;
+            };
+            let root = std::env::temp_dir().join(format!("dragonfly-new-{dialect}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for (path, text) in &files {
+                let f = root.join(path);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(f, text).unwrap();
+            }
+            let m = nuclear_transpile::project::Manifest::read(&root).unwrap();
+            let out = nuclear_transpile::project::build(&root, &m, &d);
+            let errors: Vec<String> = out
+                .files
+                .iter()
+                .flat_map(|f| f.diagnostics.iter().filter(|x| x.is_error()).map(move |x| format!("{}: {}", f.source_path.display(), x.message)))
+                .collect();
+            assert!(errors.is_empty(), "{dialect}: {errors:?}");
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 

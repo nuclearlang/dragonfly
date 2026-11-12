@@ -30,9 +30,10 @@ Flutter only create, run, build, publish and packages.
 | File | What it does | L3 |
 |---|---|---|
 | `dragonfly/src/main.rs` | commands: `new` (n), `make` (g) with aliases, `code`, `watch`, `build`, `run`, `test [--integration]`, `analyze`, `check`, `pub`, `doctor`, `setup`, `repair`, `explain`, `credits`/`author`, gateway to flutter; `find_flutter`/`NO_FLUTTER`; root = folder with `main.nuc` | [build.md](build.md) |
-| `dragonfly/src/explain.rs` | `dragonfly explain [--json]`: a Dart/Flutter error on stdin → `title`, `hint` (`HINTS`), `frames` in `.nuc` (line map; also web stacks) | [build.md](build.md) |
+| `dragonfly/src/explain.rs` | `dragonfly explain [--json]`: a run-time error or a test's output on stdin (Dart, Python, Node stacks) → `title`, `hint` (`HINTS`), `frames` in `.nuc` (mobile: the app's line map; backend/web: `<output>/.nuclear/lines.json`); what the Loop's local agents read instead of the raw log | [build.md](build.md) |
 | `dragonfly/src/packages.rs` | `config.nuc` sync, third-party definitions, `flutter add/remove` | [packages.md](packages.md) |
 | `dragonfly/src/assets.rs` | assets by convention (ADR-0071) | [packages.md](packages.md) |
+| `dragonfly/src/generate.rs` | `dragonfly gen inspect\|component\|resource` (ADR-0103): fields from `--fields`, `--from-json <file\|url>` (nested models `<Name><Key>`, a paged answer `<Name>Page`), `--from-spec` (its example answer, else its `Key \| Type` table; `GET <url>`); `context` (the values of `[[generators.*]]`), `plan` (each piece at its `[layout]` place), `write` (never overwrites; `merge` adds a facade's missing lines); `gen_command`/`ensure_http` in `main.rs` (undeclared field types, a name declared elsewhere and a source the platform lacks are refused before anything is written; the `Http` connection from the platform's `[gen]`); test `a_generated_resource_compiles_with_every_dialect` | — |
 | `dragonfly/src/scaffold.rs` | generator templates (project, component, screen `--manager`/`--state`, statemanager/statemodel (`presentation`), stateful, usecase, repository, model, service, aggregate, config, test, event, widget, guard, global, page, integration), `snake`/`pascal`; test: every skeleton parses | — |
 | `dragonfly/src/vscode.rs` | `build/<name>.code-workspace` | [build.md](build.md) |
 | `dragonfly/src/doctor.rs`, `setup.rs` | `doctor` (only NuclearLang/Dragonfly checks), `setup [--dir]` (installs Flutter step by step, asking first) | — |
@@ -51,7 +52,7 @@ dragonfly new shop_app && cd shop_app && dragonfly code
 
 ## Platforms and the manifest (ADR-0093)
 
-`dragonfly new [-p mobile] [-d flutter] <name>`: the dialect is loaded and must belong to the platform; mobile/flutter
+`dragonfly new [-p mobile] [-d flutter] <name>`: a dialect alone gives its platform (`-d nestjs` is backend), a platform alone its default dialect; the name must be letters, digits and `_` and an option glued to it (`shop-p`) or a stray word (`backend` without `-p`) is refused with a hint (`platform_and_dialect`, `new_name`, `hint_for`); the dialect is loaded and must belong to the platform; mobile/flutter
 is scaffolded, created and built as before; a backend dialect (`fastapi`, `nestjs`) gets `scaffold::backend_project`
 (`config.nuc` + `config/project_config.nuc`) and a web/react project gets `scaffold::web_project` (`config.nuc` + `main.nuc`
 with the router + `config/project_config.nuc`); both are built with `nuclear build .` and run through the dialect's
@@ -70,7 +71,12 @@ app; for it,
 `{{packages}}` = `<install>/packages`) with `sh -c` (`cmd /C` on Windows) in the output folder (`backend_command`;
 more placeholders through `vars`, quoted by `shell_quote`). `dragonfly migrate [make "<message>" | up | down]` runs
 `migrate_make` / `migrate` / `migrate_down` with `{{message}}` and `{{migrations}}` = `<project>/migrations`
-(`migrate_command`, ADR-0100 §5). `dragonfly new -p backend`
+(`migrate_command`, ADR-0100 §5). `install` also runs `[toolchain] install_local` once per folder dependency of
+`config.nuc` (`{{path}}`; a package manager keeps the old copy of a folder whose version did not change).
+`dragonfly make <kind> <component> <Name> [--screen <s>]` in a backend or web project (`make_from_layout`) writes the
+platform's `[skeletons]` entry of the kind at its `[layout]` path (platform.toml; test
+`make_writes_every_kind_where_the_platform_says`); the mobile generators of `scaffold.rs` are unchanged.
+`dragonfly new -p backend`
 writes `SQLite(file = env("DATABASE", "app.sqlite"), createTables = true)`, `plugins(sqlite = true)` and a first
 test in `test/app_test.nuc` (`scaffold::backend_project`). `dragonfly new -p web -d react` writes `main.nuc` (the App
 with `createElement(RouterProvider, router = appRouter())`) and an `Http` connection (`scaffold::web_project`); add

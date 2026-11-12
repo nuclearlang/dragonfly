@@ -91,6 +91,16 @@ How a dialect declares its plugins: [projects.md §3.3](https://github.com/nucle
 
 The native kinds of each platform, and how to write your own kind without touching the compiler: [Kinds](kinds.md).
 
+## Generators: the finished code of a resource
+
+`dragonfly gen resource <component> <Name>` writes, for any platform, the models, the repository (REST over an `Http`
+connection or a database), one use case per action, the component's facade, the controller (backend) or the screen
+with its state manager (mobile, web) and their tests; everything compiles as written. The fields come from
+`--fields "id:int name:string"`, from an answer (`--from-json <url|file>`: nested models and pages included, `@key`
+for snake_case keys) or from a spec (`--from-spec spec.md`: its example answer, its `Key | Type` table, its
+`GET <url>` line). `dragonfly gen inspect` lists what the project has; nothing is ever overwritten. The MCP server
+gives the same tools to an agent, and the editor's Loop runs them before planning. Why: ADR-0103.
+
 ## Writing with an AI agent
 
 Each dialect has a short sheet for agents: `nuclear spec --brief --dialect fastapi` (also `nestjs`, `flutter`),

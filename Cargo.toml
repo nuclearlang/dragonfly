@@ -16,4 +16,5 @@ homepage = "https://nuclearlang.github.io"
 nuclear-diag = { path = "../crates/nuclear-diag" }
 nuclear-dialect = { path = "../crates/nuclear-dialect" }
 nuclear-transpile = { path = "../crates/nuclear-transpile" }
+nuclear-syntax = { path = "../crates/nuclear-syntax" }
 serde_json = "1"
