@@ -463,9 +463,7 @@ mod tests {
     #[test]
     fn blocks_use_two_pixels_per_cell_and_texts_replace_them() {
         let mut img = solid(4, 8, [255, 255, 255]);
-        for x in 0..4 {
-            img.px[x] = [0, 0, 255]; // top row blue
-        }
+        img.px[..4].fill([0, 0, 255]); // top row blue
         let area = Area { col: 0, row: 0, cols: 4, rows: 4 };
         let c = cells(&img, area, (40, 40), &[]);
         assert_eq!(c[0].ch, '▀');
