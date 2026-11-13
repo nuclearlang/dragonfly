@@ -98,7 +98,14 @@ connection or a database), one use case per action, the component's facade, the 
 with its state manager (mobile, web) and their tests; everything compiles as written. The fields come from
 `--fields "id:int name:string"`, from an answer (`--from-json <url|file>`: nested models and pages included, `@key`
 for snake_case keys) or from a spec (`--from-spec spec.md`: its example answer, its `Key | Type` table, its
-`GET <url>` line). `dragonfly gen inspect` lists what the project has; nothing is ever overwritten. The MCP server
+`GET <url>` line). `dragonfly gen inspect` lists what the project has; nothing is ever overwritten.
+
+`dragonfly gen usecase <component> <Name>` wires a use case into its component: its alias in the facade and, on the
+backend, `--route "POST orders/{id}/cancel"` adds its route to the controller of `orders` (made when missing). A use
+case with rules of its own is written first and then wired, with the signature the project gives it; one that only
+calls a repository method is written by the command too: `--calls OrderRepository.pending`.
+
+Every option, what each platform gets, the refusals and worked examples: [Generators](generators.md). The MCP server
 gives the same tools to an agent, and the editor's Loop runs them before planning. Why: ADR-0103.
 
 ## Writing with an AI agent

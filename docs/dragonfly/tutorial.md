@@ -105,7 +105,14 @@ dragonfly gen resource catalog Book --fields "title:string author:string year:in
 dragonfly gen inspect                   # what the project has, as JSON
 ```
 
-Write by hand only what is yours: a use case with its own rules, the details of a view.
+Write by hand only what is yours: a use case with its own rules, the details of a view. A use case you wrote is wired
+by its generator (its alias in the facade; on the backend, its route), and one that only calls a repository method
+is written by it too:
+
+```sh
+dragonfly gen usecase catalog LendBook --route "POST books/{bookId}/lend"   # backend: LendBook is in the project
+dragonfly gen usecase characters CharacterEpisodes --calls CharacterRepository.episodes   # a method the repository declares
+```
 
 ## 3. Write the business logic
 

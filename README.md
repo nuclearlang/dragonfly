@@ -50,6 +50,7 @@ cd shop_app
 dragonfly code                    # VS Code: ▷ on a .nuc or F5 runs the app; saving a .nuc reloads it
 dragonfly g c products            # component
 dragonfly gen resource characters Character --from-json https://rickandmortyapi.com/api/character  # finished code from an API
+dragonfly gen usecase characters CharacterEpisodes --calls CharacterRepository.episodes   # a use case over a repository method, wired
 dragonfly g s products detail --route /detail -m DetailManager -st DetailView
 dragonfly test
 dragonfly help                    # every command

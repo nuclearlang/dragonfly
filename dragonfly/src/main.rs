@@ -89,6 +89,9 @@ finished code from a resource's data (every platform; ADR-0103): dragonfly gen <
       --from-json <file|url> | --from-spec <spec.md> | --fields \"id:int name:string origin:Origin?\"
       [--source rest[:<base url>]|db] [--path p] [--actions list,get,search,create,update,delete]
       [--screen <screen>] [--plural Names] [--dry-run]       (dragonfly gen alone prints every option)
+  usecase <component> <Name>            a use case wired into its component: its alias in the facade and, with
+                                        --route, its route in the controller (backend)
+      [--calls <Repository>.<method>] [--route \"POST orders/{id}/cancel\"] [--dry-run]
 
 packages (config.nuc: the project's pubspec, written in Nuclear)
   flutter add <package>[:version]... [--dev]  add a package to config.nuc and the app, and generate its
@@ -1311,6 +1314,14 @@ options of gen resource:
   --actions list,get,search,create,update,delete   (default: list,get for rest; every one for db)
   --screen <screen>          mobile and web: a screen that lists the resource
   --plural <Names>           when the English plural is not the right one
+  --dry-run                  show the files, write nothing
+  dragonfly gen usecase <component> <Name> [options]      a use case wired into its component: its alias in the facade
+                                                          and, with --route, its route in the controller (backend)
+options of gen usecase:
+  --calls <Repository>.<method>   write the use case too: it only calls that method, which a repository of the project
+                             declares (without it <Name> is a use case the project has: its rules are written by hand)
+  --route \"<VERB> <prefix>[/<path>]\"   backend: the route that calls it (\"POST orders/{id}/cancel\": the controller of
+                             `orders` gets it, created when missing; a {name} of the path is a parameter of the use case)
   --dry-run                  show the files, write nothing";
 
 fn fetch_text(source: &str) -> Result<String, String> {
@@ -1465,6 +1476,13 @@ fn gen_command(root: &Path, rest: Vec<String>) -> Result<(), String> {
             if let Some(bad) = actions.iter().find(|a| !generate::ACTIONS.contains(&a.as_str())) {
                 return Err(format!("unknown action '{bad}' (actions: {})", generate::ACTIONS.join(", ")));
             }
+            // which column a stored resource is searched by is a decision: a query of its repository, then wired
+            if matches!(source, generate::Source::Db) && actions.iter().any(|a| a == "search") {
+                return Err(format!(
+                    "a database resource has no generated search: which column it searches is yours to say. Write the query in {name}Repository, then `dragonfly gen usecase {component} Search{} --calls {name}Repository.<method>`",
+                    plural.clone().unwrap_or_else(|| generate::plural(&name))
+                ));
+            }
             let r = generate::Resource {
                 plural: plural.unwrap_or_else(|| generate::plural(&name)),
                 name,
@@ -1493,12 +1511,78 @@ fn gen_command(root: &Path, rest: Vec<String>) -> Result<(), String> {
             }
             ctx
         }
+        "usecase" => {
+            let calls = take_option(&mut rest, "--calls");
+            let route = take_option(&mut rest, "--route");
+            let [_, component, name] = rest.as_slice() else { return Err(GEN_USAGE.into()) };
+            let name = scaffold::pascal(&scaffold::snake(name));
+            let component = scaffold::snake(component);
+            let shape = |n: &str| nuclear_transpile::map::shape(root, &m, &d, n);
+            let platform = m.platform.as_deref().unwrap_or("?");
+            let has = |when: &str| d.generators.get("usecase").is_some_and(|ps| ps.iter().any(|p| p.when.as_deref() == Some(when)));
+            // a use case the project declares is wired as it is; else it is written over the repository method it calls
+            let (sig, calls) = match (shape(&name), &calls) {
+                (Some(found), _) => {
+                    if !found.file.starts_with(&format!("components/{component}/")) {
+                        return Err(format!("{name} is declared in {}, not in the component {component}", found.file));
+                    }
+                    let exec = found.methods.into_iter().find(|x| x.name == "exec").ok_or_else(|| format!("{name} ({}) has no exec", found.file))?;
+                    (exec, None)
+                }
+                (None, Some(c)) => {
+                    let (repository, method) = c.split_once('.').ok_or("--calls <Repository>.<method> (--calls OrderRepository.pending)")?;
+                    let found = shape(repository).ok_or_else(|| format!("{repository} is not declared in this project (`dragonfly gen inspect` lists what is)"))?;
+                    let declared: Vec<&str> = found.methods.iter().map(|x| x.name.as_str()).collect();
+                    let sig = found.methods.iter().find(|x| x.name == method).cloned().ok_or_else(|| {
+                        format!("{repository} ({}) declares no method {method} (it declares: {}); a use case over a method that comes with the repository is written by hand", found.file, declared.join(", "))
+                    })?;
+                    (sig, Some((repository.to_string(), method.to_string())))
+                }
+                (None, None) => {
+                    let place = d.layout.get("usecase").map(|p| p.replace("{component}", &component).replace("{file}", &scaffold::snake(&name))).unwrap_or_default();
+                    return Err(format!(
+                        "{name} is not declared. A use case with rules of its own is written first ({place}: `usecase {name}(...)` with `exec(...) Result<Error, T>`), then this command wires it; one that only calls a repository is written here: --calls <Repository>.<method>"
+                    ));
+                }
+            };
+            let answers = sig.ret.clone().unwrap_or_else(|| "nothing".into());
+            let (error, value, calls) = match (generate::result_parts(&answers), calls) {
+                (Some((e, v)), None) => (e, v, None),
+                (None, None) => return Err(format!("{name}.exec answers {answers}: a use case answers Result<E, T>")),
+                (parts, Some((repository, method))) => {
+                    if sig.ret.is_none() {
+                        return Err(format!("{repository}.{method} answers nothing: a use case over it is written by hand"));
+                    }
+                    let result = parts.is_some();
+                    if !has(if result { "result" } else { "plain" }) {
+                        return Err(format!("the {platform} platform writes no use case over a method that answers {answers}: write it by hand, then run this again to wire it"));
+                    }
+                    let (e, v) = parts.unwrap_or_else(|| ("Error".into(), answers.clone()));
+                    (e, v, Some((repository, method, result)))
+                }
+            };
+            let route = match route {
+                Some(_) if !has("route") => return Err(format!("the {platform} platform has no routes: there a screen calls the facade's alias")),
+                Some(text) => {
+                    let mut r = generate::parse_route(&text, &sig.args)?;
+                    // a controller the project has names the facade its own way
+                    if let Some((app, _)) = shape(&r.controller()).and_then(|c| c.params.into_iter().next()) {
+                        r.app = app;
+                    }
+                    Some(r)
+                }
+                None => None,
+            };
+            // the use case `gen` writes awaits its repository; one of the project says so itself
+            let awaits = calls.is_some() || sig.awaits;
+            generate::usecase_context(&generate::UseCase { name, component, params: sig.params, args: sig.args, error, value, awaits, calls, route })
+        }
         _ => return Err(GEN_USAGE.into()),
     };
     let files = generate::plan(&d, &what, &ctx)?;
     // a name a new file declares that another file of the project already declares (N0303): stop before writing
     let declared = nuclear_transpile::map::inventory(root, &m, &d);
-    for (path, _, _) in files.iter().filter(|(p, _, merge)| !merge && !root.join(p).exists()) {
+    for (path, _, _) in files.iter().filter(|(p, _, _)| !root.join(p).exists()) {
         let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("");
         if let Some(x) = declared.iter().find(|x| scaffold::snake(&x.name) == stem) {
             return Err(format!("{} is already declared in {}: remove or rename it, or generate another name", x.name, x.file));
@@ -1557,8 +1641,37 @@ mod tests {
             std::fs::create_dir_all(origin.parent().unwrap()).unwrap();
             std::fs::write(&origin, "CharacterOrigin\n  name: string\n").unwrap();
             gen_command(&root, args(&["resource", "characters", "Character", "--fields", "id:int name:string origin:CharacterOrigin tags:string[] note?:string", "--source", "rest:https://example.com/api", "--actions", "list,get,search,create,update,delete", "--screen", "characters"])).unwrap();
+            // a use case that only calls a repository method is written and gets its alias in the facade
+            gen_command(&root, args(&["usecase", "characters", "FindCharacter", "--calls", "CharacterRepository.search"])).unwrap();
+            let facade = std::fs::read_to_string(root.join(d.layout["appcomponent"].replace("{component}", "characters"))).unwrap();
+            assert!(facade.contains("  findCharacter() = FindCharacter.exec\n"), "{dialect}: {facade}");
+            assert!(gen_command(&root, args(&["usecase", "characters", "Missing"])).is_err_and(|e| e.contains("not declared")), "{dialect}");
+            assert!(gen_command(&root, args(&["usecase", "characters", "Missing", "--calls", "CharacterRepository.nothing"])).is_err_and(|e| e.contains("declares no method")), "{dialect}");
+            // an action added to a resource that exists: its repository gets the method it lacks (and the controller
+            // its route), so what is written still compiles
+            let planet = ["resource", "planets", "Planet", "--fields", "id:int name:string", "--source", "rest:https://example.com/api", "--actions"];
+            gen_command(&root, args(&[&planet[..], &["list"]].concat())).unwrap();
+            gen_command(&root, args(&[&planet[..], &["list,search"]].concat())).unwrap();
+            let planets = std::fs::read_to_string(root.join(d.layout["repository"].replace("{component}", "planets").replace("{file}", "planet_repository"))).unwrap();
+            assert!(planets.contains("  search(name: string)"), "{dialect}: {planets}");
             if db {
                 gen_command(&root, args(&["resource", "catalog", "Book", "--fields", "title:string year:int", "--source", "db"])).unwrap();
+                // which column a stored resource is searched by is not the generator's to choose
+                let search = gen_command(&root, args(&["resource", "catalog", "Book", "--fields", "title:string year:int", "--source", "db", "--actions", "search"]));
+                assert!(search.is_err_and(|e| e.contains("no generated search") && e.contains("gen usecase catalog SearchBooks --calls BookRepository.<method>")), "{dialect}");
+                // a query that answers no Result goes inside an Ok; its route makes the controller of its prefix
+                gen_command(&root, args(&["usecase", "catalog", "PageBooks", "--calls", "BookRepository.page", "--route", "GET shelves/{page}"])).unwrap();
+                let shelves = std::fs::read_to_string(root.join("components/catalog/api/shelves_controller.nuc")).unwrap();
+                assert!(shelves.contains("  @get(\"{page}\")\n  pageBooks(page: int, size: int) Result<Error, Page<Book>>\n    ~app.pageBooks(page, size)\n"), "{dialect}: {shelves}");
+                // a use case written by hand is wired as it is: its route joins the controller the resource has, and
+                // calls it without `~` because it does not await
+                std::fs::write(root.join("components/catalog/domain/usecases/tidy_title.nuc"), "// The title, as it is kept.\nusecase TidyTitle()\n  exec(title: string) Result<Error, string>\n    Ok(title)\n").unwrap();
+                gen_command(&root, args(&["usecase", "catalog", "TidyTitle", "--route", "GET books/tidy"])).unwrap();
+                let books = std::fs::read_to_string(root.join("components/catalog/api/books_controller.nuc")).unwrap();
+                assert!(books.ends_with("\n  @get(\"tidy\")\n  tidyTitle(title: string) Result<Error, string>\n    app.tidyTitle(title)\n"), "{dialect}: {books}");
+                assert!(gen_command(&root, args(&["usecase", "catalog", "TidyTitle", "--route", "GET books/{id}"])).is_err_and(|e| e.contains("{id}")), "{dialect}");
+            } else {
+                assert!(gen_command(&root, args(&["usecase", "characters", "FindCharacter", "--route", "GET characters/find"])).is_err_and(|e| e.contains("no routes")), "{dialect}");
             }
             let m = nuclear_transpile::project::Manifest::read(&root).unwrap();
             let out = nuclear_transpile::project::build(&root, &m, &d);

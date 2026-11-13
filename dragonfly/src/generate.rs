@@ -367,6 +367,110 @@ pub fn context(r: &Resource) -> Value {
     Value::Map(m)
 }
 
+/// Everything `gen usecase` writes from: a use case the project declares, or one that only calls a repository method.
+#[derive(Debug, Clone)]
+pub struct UseCase {
+    pub name: String,
+    pub component: String,
+    /// The parameters of `exec` as written (`id: int, input: Order`) and their names.
+    pub params: String,
+    pub args: Vec<String>,
+    /// The two types of its `Result<error, value>`.
+    pub error: String,
+    pub value: String,
+    /// `exec` is asynchronous (it uses `~`): what calls it writes `~` too.
+    pub awaits: bool,
+    /// The repository method it calls, when `gen` writes the use case: (repository, method, it answers a `Result`).
+    pub calls: Option<(String, String, bool)>,
+    pub route: Option<Route>,
+}
+
+/// A route: `POST orders/{id}/cancel` is the verb, the controller's prefix and the path under it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Route {
+    pub verb: String,
+    pub prefix: String,
+    pub path: String,
+    /// The controller's name for the facade it calls (`app`, or the one an existing controller writes).
+    pub app: String,
+}
+
+impl Route {
+    /// The controller of the route's prefix: `order-items` → `OrderItemsController`.
+    pub fn controller(&self) -> String {
+        format!("{}Controller", scaffold::pascal(&scaffold::snake(&self.prefix)))
+    }
+}
+
+pub const VERBS: &[&str] = &["get", "post", "put", "patch", "delete"];
+
+/// `Result<Error, <string, int>>` → (`Error`, `<string, int>`).
+pub fn result_parts(ty: &str) -> Option<(String, String)> {
+    let inner = ty.strip_prefix("Result<")?.strip_suffix('>')?;
+    let mut depth = 0;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => return Some((inner[..i].trim().to_string(), inner[i + 1..].trim().to_string())),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `POST orders/{id}/cancel` → the route; every `{name}` of its path must be a parameter of the use case.
+pub fn parse_route(text: &str, args: &[String]) -> Result<Route, String> {
+    let form = "--route \"<GET|POST|PUT|PATCH|DELETE> <prefix>[/<path>]\" (\"POST orders/{id}/cancel\")";
+    let (verb, path) = text.trim().split_once(' ').ok_or(form)?;
+    let verb = verb.to_lowercase();
+    if !VERBS.contains(&verb.as_str()) {
+        return Err(format!("'{verb}' is not a verb: {form}"));
+    }
+    let path = path.trim().trim_matches('/');
+    let (prefix, rest) = path.split_once('/').unwrap_or((path, ""));
+    if prefix.is_empty() || prefix.contains('{') {
+        return Err(format!("the first segment of a route is its controller's prefix: {form}"));
+    }
+    for name in rest.split('{').skip(1).filter_map(|s| s.split('}').next()) {
+        if !args.iter().any(|a| a == name) {
+            let takes = if args.is_empty() { "nothing".to_string() } else { args.join(", ") };
+            return Err(format!("the route names {{{name}}}, which the use case does not take (it takes: {takes})"));
+        }
+    }
+    Ok(Route { verb, prefix: prefix.to_string(), path: rest.to_string(), app: "app".into() })
+}
+
+/// The values every template of `gen usecase` reads (the backend platform's platform.toml lists them).
+pub fn usecase_context(u: &UseCase) -> Value {
+    let mut m = BTreeMap::from([
+        ("UseCase".into(), s(&u.name)),
+        ("alias".into(), s(camel(&u.name))),
+        ("component".into(), s(&u.component)),
+        ("Component".into(), s(scaffold::pascal(&u.component))),
+        ("params".into(), s(&u.params)),
+        ("args".into(), s(u.args.join(", "))),
+        ("error".into(), s(&u.error)),
+        ("value".into(), s(&u.value)),
+        ("async".into(), Value::Bool(u.awaits)),
+    ]);
+    if let Some((repository, method, result)) = &u.calls {
+        m.insert("Repository".into(), s(repository));
+        m.insert("method".into(), s(method));
+        // which use case is written: the method's own Result, or its plain answer inside an Ok
+        m.insert(if *result { "result" } else { "plain" }.into(), Value::Bool(true));
+    }
+    if let Some(r) = &u.route {
+        m.insert("route".into(), Value::Bool(true));
+        m.insert("verb".into(), s(&r.verb));
+        m.insert("prefix".into(), s(&r.prefix));
+        m.insert("path".into(), s(&r.path));
+        m.insert("Controller".into(), s(r.controller()));
+        m.insert("app".into(), s(&r.app));
+    }
+    Value::Map(m)
+}
+
 /// The value at a dotted path of the context (`actions.list`).
 fn lookup<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.').try_fold(v, |cur, key| match cur {
@@ -418,8 +522,28 @@ pub fn plan(d: &Dialect, what: &str, ctx: &Value) -> Result<Vec<(PathBuf, String
     Ok(out)
 }
 
-/// Writes the planned files: a new file as it is; an existing one is kept, except a facade (`merge`) that gets the
-/// indented lines (its aliases) it does not have yet. Returns what happened to each file.
+/// The members of a generated file: each one is its decorators, its head line and its body.
+fn members(text: &str) -> Vec<Vec<&str>> {
+    let mut out: Vec<Vec<&str>> = Vec::new();
+    // the open member already has its head: the next line at the members' indent opens another
+    let mut headed = true;
+    for l in text.lines().filter(|l| l.starts_with("  ") && !l.trim().is_empty()) {
+        let at_member = !l.starts_with("   ");
+        if at_member && headed {
+            out.push(Vec::new());
+            headed = false;
+        }
+        headed |= at_member && !l.trim_start().starts_with('@');
+        if let Some(m) = out.last_mut() {
+            m.push(l);
+        }
+    }
+    out
+}
+
+/// Writes the planned files: a new file as it is; an existing one is kept, except a `merge` one (a facade, a
+/// controller) that gets the members it does not have yet (an alias; a route with its decorator and its body), told
+/// by their head line. Returns what happened to each file.
 pub fn write(root: &Path, files: &[(PathBuf, String, bool)]) -> std::io::Result<Vec<(String, &'static str)>> {
     let mut report = Vec::new();
     for (rel, text, merge) in files {
@@ -431,7 +555,8 @@ pub fn write(root: &Path, files: &[(PathBuf, String, bool)]) -> std::io::Result<
                 continue;
             }
             let mut have = std::fs::read_to_string(&p)?;
-            let missing: Vec<&str> = text.lines().filter(|l| l.starts_with("  ") && !l.trim().is_empty() && !have.contains(l.trim())).collect();
+            let head = |m: &Vec<&str>| m.iter().find(|l| !l.trim_start().starts_with('@')).unwrap_or(&m[0]).trim().to_string();
+            let missing: Vec<Vec<&str>> = members(text).into_iter().filter(|m| !have.contains(&head(m))).collect();
             if missing.is_empty() {
                 report.push((shown, "kept"));
                 continue;
@@ -439,9 +564,15 @@ pub fn write(root: &Path, files: &[(PathBuf, String, bool)]) -> std::io::Result<
             if !have.ends_with('\n') {
                 have.push('\n');
             }
-            for l in missing {
-                have.push_str(l);
-                have.push('\n');
+            for m in missing {
+                // a member of several lines stands apart, an alias follows the others
+                if m.len() > 1 {
+                    have.push('\n');
+                }
+                for l in m {
+                    have.push_str(l);
+                    have.push('\n');
+                }
             }
             std::fs::write(&p, have)?;
             report.push((shown, "added to"));
@@ -493,6 +624,35 @@ mod tests {
         assert_eq!((page.name.as_str(), key.as_str()), ("CharacterPage", "results"));
         assert!(page.fields.iter().any(|f| f.name == "info" && f.ty == "CharacterPageInfo"));
         assert!(page.fields.iter().any(|f| f.name == "results" && f.ty == "Character[]"));
+    }
+
+    #[test]
+    fn a_route_is_a_verb_a_prefix_and_a_path_of_the_parameters() {
+        let args = vec!["id".to_string(), "input".to_string()];
+        let r = parse_route("POST /orders/{id}/cancel", &args).unwrap();
+        assert_eq!((r.verb.as_str(), r.prefix.as_str(), r.path.as_str()), ("post", "orders", "{id}/cancel"));
+        assert_eq!(parse_route("get orders", &[]).unwrap().path, "");
+        assert!(parse_route("POST orders/{order}", &args).unwrap_err().contains("{order}"));
+        assert!(parse_route("FETCH orders", &args).is_err());
+        assert!(parse_route("GET {id}", &args).is_err());
+        assert_eq!(result_parts("Result<Error, <string, int>>"), Some(("Error".into(), "<string, int>".into())));
+        assert_eq!(result_parts("Page<Order>"), None);
+    }
+
+    /// A merge adds a whole member, told by its head: a route whose bare `@get` the file already writes keeps its own.
+    #[test]
+    fn a_merge_adds_whole_members() {
+        let root = std::env::temp_dir().join(format!("dragonfly-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = PathBuf::from("orders_controller.nuc");
+        std::fs::write(root.join(&file), "controller OrdersController(app: OrdersAppComponent)\n  @get\n  list() Result<Error, Order[]>\n    ~app.listOrders()\n").unwrap();
+        let new = "controller OrdersController(app: OrdersAppComponent)\n  @get\n  list() Result<Error, Order[]>\n    ~app.listOrders()\n\n  @get\n  countOrders() Result<Error, int>\n    ~app.countOrders()\n";
+        let report = write(&root, &[(file.clone(), new.into(), true)]).unwrap();
+        assert_eq!(report[0].1, "added to");
+        let have = std::fs::read_to_string(root.join(&file)).unwrap();
+        assert!(have.ends_with("    ~app.listOrders()\n\n  @get\n  countOrders() Result<Error, int>\n    ~app.countOrders()\n"), "{have}");
+        assert_eq!(write(&root, &[(file, new.into(), true)]).unwrap()[0].1, "kept");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
